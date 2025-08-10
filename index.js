@@ -1,12 +1,13 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const { Twilio } = require('twilio');
+const twilioLib = require('twilio'); // simpler, reliable import
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.urlencoded({ extended: false })); // Twilio posts form-encoded
 app.use(bodyParser.json());
 
+// ---- Env ----
 const {
   PORT = 3000,
   TWILIO_ACCOUNT_SID,
@@ -17,42 +18,40 @@ const {
   SLACK_WEBHOOK_URL
 } = process.env;
 
-const twilio = new Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+// Clients
+const twilio = twilioLib(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const pd = axios.create({ baseURL: PIPEDRIVE_BASE, params: { api_token: PIPEDRIVE_API_TOKEN } });
 
 // -------- Helpers --------
 async function findPersonByPhone(phone) {
   if (!phone) return null;
 
-  // Normalize to digits and also keep the original
   const original = String(phone).trim();
   const digits = original.replace(/\D/g, '');
 
-  // Build search candidates
+  // try multiple formats so we match numbers saved as 480-xxx-xxxx, (480) xxx-xxxx, etc.
   const candidates = [];
   if (digits.length >= 10) {
-    const last10 = digits.slice(-10);      // e.g., 4805551234
-    candidates.push(last10);               // matches typical local formats
-    candidates.push('+1' + last10);        // matches E.164
-    candidates.push('1' + last10);         // matches 1XXXXXXXXXX
+    const last10 = digits.slice(-10);
+    candidates.push(last10);        // 4805551234
+    candidates.push('+1' + last10); // +14805551234
+    candidates.push('1' + last10);  // 14805551234
   }
   if (original.startsWith('+')) candidates.push(original);
 
   const uniq = [...new Set(candidates)];
-
-  // Try each candidate until we find a person
   for (const term of uniq) {
     try {
       const { data } = await pd.get('/persons/search', {
         params: { term, fields: 'phone', exact_match: false, limit: 1 }
       });
       const item = data?.data?.items?.[0]?.item;
-      if (item) return item; // Found!
-    } catch (_) { /* ignore and try next */ }
+      if (item) return item;
+    } catch (_) {}
   }
-
-  return null; // No match
+  return null;
 }
+
 async function createPersonForPhone(phone) {
   const digits = String(phone).replace(/\D/g, '');
   const last10 = digits.slice(-10);
@@ -72,8 +71,9 @@ async function createPersonForPhone(phone) {
 
 async function getPrimaryDealForPerson(personId) {
   const { data } = await pd.get(`/persons/${personId}/deals`, { params: { status: 'open', limit: 1 } });
-  return data && data.data && data.data[0] || null;
+  return (data && data.data && data.data[0]) || null;
 }
+
 async function logNote({ content, personId, dealId }) {
   return pd.post('/notes', {
     content,
@@ -81,9 +81,10 @@ async function logNote({ content, personId, dealId }) {
     deal_id: dealId || undefined
   });
 }
+
 async function notify(text) {
   if (!SLACK_WEBHOOK_URL) return;
-  try { await axios.post(SLACK_WEBHOOK_URL, { text }); } catch (e) {}
+  try { await axios.post(SLACK_WEBHOOK_URL, { text }); } catch (_) {}
 }
 
 // -------- Health check --------
@@ -108,25 +109,7 @@ app.post('/inbound', async (req, res) => {
     });
 
     await notify(`📲 New SMS from ${from}${person ? ` (${person.name || ''})` : ''}: ${body}`);
-    res.type('text/xml').send('<Response/>');
-  } catch (e) {
-    console.error(e);
-    res.status(500).send('error');
-  }
-});
-
-
-    await notify(`📲 New SMS from ${from}${person ? ` (${person.name || ''})` : ''}: ${body}`);
-    res.type('text/xml').send('<Response/>');
-  } catch (e) {
-    console.error(e);
-    res.status(500).send('error');
-  }
-});
-
-
-    await notify(`📲 New SMS from ${from}${person ? ` (${person.name})` : ''}: ${body}`);
-    res.type('text/xml').send('<Response/>');
+    res.type('text/xml').send('<Response/>'); // minimal TwiML response
   } catch (e) {
     console.error(e);
     res.status(500).send('error');
@@ -157,10 +140,12 @@ app.post('/send', async (req, res) => {
   try {
     const { to, message, personId, dealId } = req.body;
     const msg = await twilio.messages.create({ to, from: TWILIO_NUMBER, body: message });
+
     await logNote({
       content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
       personId, dealId
     });
+
     res.json({ ok: true, sid: msg.sid });
   } catch (e) {
     console.error(e);
