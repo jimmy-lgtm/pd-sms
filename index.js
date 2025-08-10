@@ -22,10 +22,54 @@ const pd = axios.create({ baseURL: PIPEDRIVE_BASE, params: { api_token: PIPEDRIV
 
 // -------- Helpers --------
 async function findPersonByPhone(phone) {
-  const q = phone.replace(/[^\d+]/g, '');
-  const { data } = await pd.get('/persons/search', { params: { term: q, fields: 'phone', exact_match: false, limit: 1 } });
-  return (data && data.data && data.data.items && data.data.items[0] && data.data.items[0].item) || null;
+  if (!phone) return null;
+
+  // Normalize to digits and also keep the original
+  const original = String(phone).trim();
+  const digits = original.replace(/\D/g, '');
+
+  // Build search candidates
+  const candidates = [];
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);      // e.g., 4805551234
+    candidates.push(last10);               // matches typical local formats
+    candidates.push('+1' + last10);        // matches E.164
+    candidates.push('1' + last10);         // matches 1XXXXXXXXXX
+  }
+  if (original.startsWith('+')) candidates.push(original);
+
+  const uniq = [...new Set(candidates)];
+
+  // Try each candidate until we find a person
+  for (const term of uniq) {
+    try {
+      const { data } = await pd.get('/persons/search', {
+        params: { term, fields: 'phone', exact_match: false, limit: 1 }
+      });
+      const item = data?.data?.items?.[0]?.item;
+      if (item) return item; // Found!
+    } catch (_) { /* ignore and try next */ }
+  }
+
+  return null; // No match
 }
+async function createPersonForPhone(phone) {
+  const digits = String(phone).replace(/\D/g, '');
+  const last10 = digits.slice(-10);
+  const e164 = (digits.length === 11 && digits.startsWith('1')) ? ('+' + digits) : ('+1' + last10);
+
+  const payload = {
+    name: e164, // you can rename later
+    phone: [
+      { value: e164, primary: true, label: 'mobile' },
+      { value: last10, primary: false, label: 'alt' }
+    ]
+  };
+
+  const { data } = await pd.post('/persons', payload);
+  return data?.data || null;
+}
+
 async function getPrimaryDealForPerson(personId) {
   const { data } = await pd.get(`/persons/${personId}/deals`, { params: { status: 'open', limit: 1 } });
   return data && data.data && data.data[0] || null;
@@ -52,14 +96,34 @@ app.post('/inbound', async (req, res) => {
     const body = req.body.Body || '';
     const mediaCount = Number(req.body.NumMedia || 0);
 
-    const person = await findPersonByPhone(from);
+    let person = await findPersonByPhone(from);
+    if (!person) person = await createPersonForPhone(from); // auto-create if missing
+
     const deal = person ? await getPrimaryDealForPerson(person.id) : null;
 
     await logNote({
       content: `[SMS In] ${new Date().toLocaleString()} – ${body}${mediaCount ? ' (MMS attached)' : ''}`,
-      personId: person && person.id,
-      dealId: deal && deal.id
+      personId: person?.id,
+      dealId: deal?.id
     });
+
+    await notify(`📲 New SMS from ${from}${person ? ` (${person.name || ''})` : ''}: ${body}`);
+    res.type('text/xml').send('<Response/>');
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('error');
+  }
+});
+
+
+    await notify(`📲 New SMS from ${from}${person ? ` (${person.name || ''})` : ''}: ${body}`);
+    res.type('text/xml').send('<Response/>');
+  } catch (e) {
+    console.error(e);
+    res.status(500).send('error');
+  }
+});
+
 
     await notify(`📲 New SMS from ${from}${person ? ` (${person.name})` : ''}: ${body}`);
     res.type('text/xml').send('<Response/>');
