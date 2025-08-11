@@ -4,7 +4,7 @@
 //   POST /inbound              (Twilio webhook: logs [SMS In])
 //   GET  /send-form            (Tiny form to send SMS manually)
 //   POST /send                 (Programmatic send + [SMS Out] log)
-//   POST /slack/sms            (Slack slash command /sms)
+//   POST /slack/sms            (Slack slash command /sms) — instant ACK to avoid dispatch_failed
 //   POST /pipedrive-webhook    (Pipedrive: Note added -> if "SMS:" then send)
 
 const express = require('express');
@@ -145,11 +145,11 @@ app.get('/send-form', (req, res) => {
       <h3>Send SMS</h3>
       <form method="POST" action="/send">
         <label>To</label><br/>
-        <input name="to" value="\${phone}" style="width:100%;padding:8px"/><br/><br/>
+        <input name="to" value="${phone}" style="width:100%;padding:8px"/><br/><br/>
         <label>Message</label><br/>
         <textarea name="message" rows="5" style="width:100%;padding:8px"></textarea><br/><br/>
-        <input type="hidden" name="personId" value="\${person_id}"/>
-        <input type="hidden" name="dealId" value="\${deal_id}"/>
+        <input type="hidden" name="personId" value="${person_id}"/>
+        <input type="hidden" name="dealId" value="${deal_id}"/>
         <button type="submit" style="padding:10px 16px;">Send</button>
       </form>
     </body></html>
@@ -176,45 +176,62 @@ app.post('/send', async (req, res) => {
 });
 
 // Slack slash command: /sms 4805551234 Your message...
+// Sends an immediate ACK so Slack doesn't time out (fixes "dispatch_failed")
 app.post('/slack/sms', async (req, res) => {
-  try {
-    // Only allow your workspace "studioprime"
-    if (req.body?.team_domain && req.body.team_domain !== SLACK_ALLOWED_TEAM) {
-      return res.status(403).send('Unauthorized workspace');
+  // 1) ACK immediately
+  res.status(200).send('Sending…');
+
+  // 2) Continue in the background and post back to Slack via response_url
+  (async () => {
+    const responseUrl = req.body?.response_url;
+    const postBack = async (text) => {
+      if (!responseUrl) return;
+      try {
+        await axios.post(responseUrl, { text, response_type: 'ephemeral' });
+      } catch (_) {}
+    };
+
+    try {
+      // Only allow your workspace "studioprime"
+      if (req.body?.team_domain && req.body.team_domain !== 'studioprime') {
+        return postBack('Unauthorized workspace for /sms');
+      }
+
+      const text = (req.body?.text || '').trim();
+      const [first, ...rest] = text.split(/\s+/);
+      const message = rest.join(' ');
+
+      if (!first || !message) {
+        return postBack('Usage: /sms 4805551234 Your message');
+      }
+
+      // Normalize number
+      const digits = first.replace(/\D/g, '');
+      const to = first.startsWith('+')
+        ? first
+        : (digits.length === 11 && digits.startsWith('1')) ? ('+' + digits)
+        : (digits.length === 10) ? ('+1' + digits)
+        : null;
+
+      if (!to) return postBack('Please enter a US number like 4805551234 or +14805551234');
+
+      // Find/create contact and log
+      let person = await findPersonByPhone(to);
+      if (!person) person = await createPersonForPhone(to);
+      const deal = person ? await getPrimaryDealForPerson(person.id) : null;
+
+      await twilio.messages.create(buildSendOpts(to, message));
+      await logNote({
+        content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
+        personId: person?.id, dealId: deal?.id
+      });
+
+      return postBack(`Sent to ${to} ✅`);
+    } catch (e) {
+      console.error(e);
+      return postBack('Something went wrong sending your SMS.');
     }
-
-    const text = (req.body?.text || '').trim();
-    const [first, ...rest] = text.split(/\s+/);
-    const message = rest.join(' ');
-
-    if (!first || !message) return res.send('Usage: /sms 4805551234 Your message');
-
-    // Normalize number
-    const digits = first.replace(/\D/g, '');
-    const to = first.startsWith('+')
-      ? first
-      : (digits.length === 11 && digits.startsWith('1')) ? ('+' + digits)
-      : (digits.length === 10) ? ('+1' + digits)
-      : null;
-
-    if (!to) return res.send('Please enter a US number like 4805551234 or +14805551234');
-
-    // Find/create contact and log
-    let person = await findPersonByPhone(to);
-    if (!person) person = await createPersonForPhone(to);
-    const deal = person ? await getPrimaryDealForPerson(person.id) : null;
-
-    await twilio.messages.create(buildSendOpts(to, message));
-    await logNote({
-      content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
-      personId: person?.id, dealId: deal?.id
-    });
-
-    return res.send(`Sent to ${to} ✅`);
-  } catch (e) {
-    console.error(e);
-    return res.send('Something went wrong sending your SMS.');
-  }
+  })();
 });
 
 // Pipedrive webhook: on Note added -> if starts with "SMS:", send via Twilio
@@ -271,3 +288,4 @@ app.post('/pipedrive-webhook', async (req, res) => {
 
 // Boot
 app.listen(PORT, () => console.log(`pd-sms running on :${PORT}`));
+
