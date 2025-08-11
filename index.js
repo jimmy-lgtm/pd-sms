@@ -1,5 +1,5 @@
 // PD-SMS — Pipedrive + Twilio + Slack minimal SMS bridge
-// Endpoints included:
+// Endpoints:
 //   GET  /health
 //   POST /inbound              (Twilio webhook: logs [SMS In])
 //   GET  /send-form            (Tiny form to send SMS manually)
@@ -24,8 +24,11 @@ const {
   TWILIO_NUMBER, // e.g. +14805305004
   TWILIO_MESSAGING_SERVICE_SID, // optional: MGxxxxxxxx; recommended for A2P
   PIPEDRIVE_API_TOKEN,
-  PIPEDRIVE_BASE = 'https://api.pipedrive.com/v1',
-  SLACK_WEBHOOK_URL // optional: for inbound alerts
+  // Your Pipedrive domain API base:
+  PIPEDRIVE_BASE = 'https://primepc.pipedrive.com/api/v1',
+  SLACK_WEBHOOK_URL, // optional: inbound alerts to Slack channel
+  // Only allow your Slack workspace to use /sms:
+  SLACK_ALLOWED_TEAM = 'studioprime'
 } = process.env;
 
 // ---- Clients ----
@@ -33,9 +36,7 @@ const twilio = twilioLib(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const pd = axios.create({ baseURL: PIPEDRIVE_BASE, params: { api_token: PIPEDRIVE_API_TOKEN } });
 
 // ============ Helpers ============
-
 function buildSendOpts(to, body) {
-  // Prefer Messaging Service if provided; else send from the single number
   return TWILIO_MESSAGING_SERVICE_SID
     ? { to, messagingServiceSid: TWILIO_MESSAGING_SERVICE_SID, body }
     : { to, from: TWILIO_NUMBER, body };
@@ -144,11 +145,11 @@ app.get('/send-form', (req, res) => {
       <h3>Send SMS</h3>
       <form method="POST" action="/send">
         <label>To</label><br/>
-        <input name="to" value="${phone}" style="width:100%;padding:8px"/><br/><br/>
+        <input name="to" value="\${phone}" style="width:100%;padding:8px"/><br/><br/>
         <label>Message</label><br/>
         <textarea name="message" rows="5" style="width:100%;padding:8px"></textarea><br/><br/>
-        <input type="hidden" name="personId" value="${person_id}"/>
-        <input type="hidden" name="dealId" value="${deal_id}"/>
+        <input type="hidden" name="personId" value="\${person_id}"/>
+        <input type="hidden" name="dealId" value="\${deal_id}"/>
         <button type="submit" style="padding:10px 16px;">Send</button>
       </form>
     </body></html>
@@ -177,6 +178,11 @@ app.post('/send', async (req, res) => {
 // Slack slash command: /sms 4805551234 Your message...
 app.post('/slack/sms', async (req, res) => {
   try {
+    // Only allow your workspace "studioprime"
+    if (req.body?.team_domain && req.body.team_domain !== SLACK_ALLOWED_TEAM) {
+      return res.status(403).send('Unauthorized workspace');
+    }
+
     const text = (req.body?.text || '').trim();
     const [first, ...rest] = text.split(/\s+/);
     const message = rest.join(' ');
