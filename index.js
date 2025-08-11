@@ -1,35 +1,53 @@
+// PD-SMS — Pipedrive + Twilio + Slack minimal SMS bridge
+// Endpoints included:
+//   GET  /health
+//   POST /inbound              (Twilio webhook: logs [SMS In])
+//   GET  /send-form            (Tiny form to send SMS manually)
+//   POST /send                 (Programmatic send + [SMS Out] log)
+//   POST /slack/sms            (Slack slash command /sms)
+//   POST /pipedrive-webhook    (Pipedrive: Note added -> if "SMS:" then send)
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const twilioLib = require('twilio'); // simpler, reliable import
+const twilioLib = require('twilio');
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false })); // Twilio posts form-encoded
-app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false })); // Slack & Twilio post urlencoded
+app.use(bodyParser.json());                           // Pipedrive posts JSON
 
 // ---- Env ----
 const {
   PORT = 3000,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
-  TWILIO_NUMBER,
+  TWILIO_NUMBER, // e.g. +14805305004
+  TWILIO_MESSAGING_SERVICE_SID, // optional: MGxxxxxxxx; recommended for A2P
   PIPEDRIVE_API_TOKEN,
   PIPEDRIVE_BASE = 'https://api.pipedrive.com/v1',
-  SLACK_WEBHOOK_URL
+  SLACK_WEBHOOK_URL // optional: for inbound alerts
 } = process.env;
 
-// Clients
+// ---- Clients ----
 const twilio = twilioLib(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const pd = axios.create({ baseURL: PIPEDRIVE_BASE, params: { api_token: PIPEDRIVE_API_TOKEN } });
 
-// -------- Helpers --------
+// ============ Helpers ============
+
+function buildSendOpts(to, body) {
+  // Prefer Messaging Service if provided; else send from the single number
+  return TWILIO_MESSAGING_SERVICE_SID
+    ? { to, messagingServiceSid: TWILIO_MESSAGING_SERVICE_SID, body }
+    : { to, from: TWILIO_NUMBER, body };
+}
+
 async function findPersonByPhone(phone) {
   if (!phone) return null;
 
   const original = String(phone).trim();
   const digits = original.replace(/\D/g, '');
 
-  // try multiple formats so we match numbers saved as 480-xxx-xxxx, (480) xxx-xxxx, etc.
+  // Try multiple formats so we match numbers saved like 480-xxx-xxxx, (480) xxx-xxxx, etc.
   const candidates = [];
   if (digits.length >= 10) {
     const last10 = digits.slice(-10);
@@ -58,7 +76,7 @@ async function createPersonForPhone(phone) {
   const e164 = (digits.length === 11 && digits.startsWith('1')) ? ('+' + digits) : ('+1' + last10);
 
   const payload = {
-    name: e164, // you can rename later
+    name: e164, // rename later in Pipedrive
     phone: [
       { value: e164, primary: true, label: 'mobile' },
       { value: last10, primary: false, label: 'alt' }
@@ -87,10 +105,12 @@ async function notify(text) {
   try { await axios.post(SLACK_WEBHOOK_URL, { text }); } catch (_) {}
 }
 
-// -------- Health check --------
+// ============ Routes ============
+
+// Health
 app.get('/health', (req, res) => res.send('ok'));
 
-// -------- Inbound SMS (Twilio webhook) --------
+// Inbound SMS from Twilio -> log [SMS In]
 app.post('/inbound', async (req, res) => {
   try {
     const from = req.body.From;
@@ -98,7 +118,7 @@ app.post('/inbound', async (req, res) => {
     const mediaCount = Number(req.body.NumMedia || 0);
 
     let person = await findPersonByPhone(from);
-    if (!person) person = await createPersonForPhone(from); // auto-create if missing
+    if (!person) person = await createPersonForPhone(from);
 
     const deal = person ? await getPrimaryDealForPerson(person.id) : null;
 
@@ -116,7 +136,7 @@ app.post('/inbound', async (req, res) => {
   }
 });
 
-// -------- Simple send form (opens from Pipedrive link) --------
+// Tiny manual send form (optional convenience)
 app.get('/send-form', (req, res) => {
   const { phone = '', person_id = '', deal_id = '' } = req.query;
   res.send(`
@@ -135,22 +155,113 @@ app.get('/send-form', (req, res) => {
   `);
 });
 
-// -------- Outbound send --------
+// Programmatic send (used by form)
 app.post('/send', async (req, res) => {
   try {
     const { to, message, personId, dealId } = req.body;
-    const msg = await twilio.messages.create({ to, from: TWILIO_NUMBER, body: message });
+
+    await twilio.messages.create(buildSendOpts(to, message));
 
     await logNote({
       content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
       personId, dealId
     });
 
-    res.json({ ok: true, sid: msg.sid });
+    res.json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ ok: false });
   }
 });
 
+// Slack slash command: /sms 4805551234 Your message...
+app.post('/slack/sms', async (req, res) => {
+  try {
+    const text = (req.body?.text || '').trim();
+    const [first, ...rest] = text.split(/\s+/);
+    const message = rest.join(' ');
+
+    if (!first || !message) return res.send('Usage: /sms 4805551234 Your message');
+
+    // Normalize number
+    const digits = first.replace(/\D/g, '');
+    const to = first.startsWith('+')
+      ? first
+      : (digits.length === 11 && digits.startsWith('1')) ? ('+' + digits)
+      : (digits.length === 10) ? ('+1' + digits)
+      : null;
+
+    if (!to) return res.send('Please enter a US number like 4805551234 or +14805551234');
+
+    // Find/create contact and log
+    let person = await findPersonByPhone(to);
+    if (!person) person = await createPersonForPhone(to);
+    const deal = person ? await getPrimaryDealForPerson(person.id) : null;
+
+    await twilio.messages.create(buildSendOpts(to, message));
+    await logNote({
+      content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
+      personId: person?.id, dealId: deal?.id
+    });
+
+    return res.send(`Sent to ${to} ✅`);
+  } catch (e) {
+    console.error(e);
+    return res.send('Something went wrong sending your SMS.');
+  }
+});
+
+// Pipedrive webhook: on Note added -> if starts with "SMS:", send via Twilio
+app.post('/pipedrive-webhook', async (req, res) => {
+  try {
+    const current = req.body?.current || {};
+    const noteId   = current?.id;
+    const personId = current?.person_id;
+    const dealId   = current?.deal_id;
+    let content    = current?.content || ''; // HTML
+
+    // Strip HTML tags
+    const plain = content.replace(/<[^>]*>/g, '').trim();
+
+    // Only act on notes that BEGIN with "SMS:"
+    const match = plain.match(/^SMS:\s*(.+)$/i);
+    if (!match) return res.send('ok');
+
+    const message = match[1];
+
+    // Load the person's phone
+    const { data: personResp } = await pd.get(`/persons/${personId}`);
+    const phones = personResp?.data?.phone || [];
+    let to = (phones.find(p => p.primary)?.value || phones[0]?.value || '').replace(/\D/g, '');
+    if (!to) return res.send('no phone on person');
+
+    // Normalize to E.164
+    to = to.startsWith('+')
+      ? to
+      : (to.length === 11 && to.startsWith('1')) ? ('+' + to)
+      : ('+1' + to.slice(-10));
+
+    // Send and log
+    await twilio.messages.create(buildSendOpts(to, message));
+
+    // Rewrite the original note so the timeline is clean
+    await pd.put(`/notes/${noteId}`, {
+      content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`
+    });
+
+    // (Optional extra log)
+    await logNote({
+      content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
+      personId, dealId
+    });
+
+    return res.send('ok');
+  } catch (e) {
+    console.error(e);
+    // Return 200 so Pipedrive doesn't keep retrying
+    return res.status(200).send('ok');
+  }
+});
+
+// Boot
 app.listen(PORT, () => console.log(`pd-sms running on :${PORT}`));
