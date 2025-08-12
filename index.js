@@ -1,4 +1,4 @@
-// PD-SMS — Pipedrive + Twilio + Slack minimal SMS bridge
+// PD-SMS — Pipedrive + Twilio + Slack SMS bridge
 // Endpoints:
 //   GET  /                     (hello)
 //   GET  /health               (uptime check)
@@ -6,7 +6,7 @@
 //   GET  /send-form            (Tiny form to send SMS manually)
 //   POST /send                 (Programmatic send + [SMS Out] log)
 //   POST /slack/sms            (Slash command /sms — instant ACK)
-//   POST /slack/events         (Reply in Slack thread -> SMS + Pipedrive log)
+//   POST /slack/events         (Reply in Slack thread -> SMS + Pipedrive log; idempotent)
 //   POST /pipedrive-webhook    (Pipedrive Note "SMS:" -> SMS)
 
 const express = require('express');
@@ -27,9 +27,9 @@ const {
   TWILIO_MESSAGING_SERVICE_SID, // MG… (recommended)
   PIPEDRIVE_API_TOKEN,
   PIPEDRIVE_BASE = 'https://primepc.pipedrive.com/api/v1', // your PD domain
-  SLACK_WEBHOOK_URL, // optional: inbound alerts to a channel
-  SLACK_ALLOWED_TEAM = 'studioprime', // your workspace guard for /sms
-  SLACK_BOT_TOKEN // required for reply-in-thread feature
+  SLACK_WEBHOOK_URL,                 // optional: inbound alerts to a channel
+  SLACK_ALLOWED_TEAM = 'studioprime',// your workspace guard for /sms
+  SLACK_BOT_TOKEN                    // required for reply-in-thread feature
 } = process.env;
 
 // ---- Clients ----
@@ -103,6 +103,14 @@ async function notify(text) {
   if (!SLACK_WEBHOOK_URL) return;
   try { await axios.post(SLACK_WEBHOOK_URL, { text }); } catch (_) {}
 }
+
+// ---- Slack event de-dup (in-memory, 10 min TTL)
+const processedEvents = new Map(); // event_id -> timestamp
+const EVENT_TTL_MS = 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of processedEvents) if (now - ts > EVENT_TTL_MS) processedEvents.delete(id);
+}, 60 * 1000);
 
 // ===== Routes =====
 app.get('/', (req, res) => res.send('pd-sms is running'));
@@ -211,16 +219,31 @@ app.post('/slack/sms', async (req, res) => {
   })();
 });
 
-// Slack Events — reply in the inbound alert thread -> send SMS + PD log
+// Slack Events — reply in inbound alert thread -> SMS + PD log (idempotent)
 app.post('/slack/events', async (req, res) => {
+  // URL verification handshake
   if (req.body?.type === 'url_verification') return res.send(req.body.challenge);
-  res.status(200).send(); // ACK immediately
+
+  // Tell Slack not to retry and ACK immediately
+  if (req.headers['x-slack-retry-num']) res.set('X-Slack-No-Retry', '1');
+  res.status(200).send();
 
   if (!slack) return; // feature not enabled without bot token
 
+  // De-dup by event_id
+  const eventId = req.body?.event_id;
+  if (eventId) {
+    if (processedEvents.has(eventId)) return;
+    processedEvents.set(eventId, Date.now());
+  }
+
   const ev = req.body?.event;
-  if (!ev || ev.type !== 'message' || ev.subtype) return; // ignore edits/bots/etc.
-  if (!ev.thread_ts) return; // only handle thread replies
+  if (!ev) return;
+
+  // Ignore anything that isn't a user message in a thread
+  if (ev.type !== 'message') return;
+  if (ev.subtype || ev.bot_id || !ev.user) return; // skip bot/system/edited etc.
+  if (!ev.thread_ts) return; // only act on thread replies
 
   try {
     // Fetch the parent message (inbound alert we posted) to extract the phone
@@ -247,6 +270,7 @@ app.post('/slack/events', async (req, res) => {
     const message = (ev.text || '').trim();
     if (!message) return;
 
+    // Send + log
     let person = await findPersonByPhone(to);
     if (!person) person = await createPersonForPhone(to);
     const deal = person ? await getPrimaryDealForPerson(person.id) : null;
