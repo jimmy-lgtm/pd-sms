@@ -235,28 +235,48 @@ app.post('/slack/sms', async (req, res) => {
 });
 
 // Pipedrive webhook: on Note added -> if starts with "SMS:", send via Twilio
+// Pipedrive webhook: on Note added -> if starts with "SMS:", send via Twilio
 app.post('/pipedrive-webhook', async (req, res) => {
   try {
     const current = req.body?.current || {};
     const noteId   = current?.id;
-    const personId = current?.person_id;
-    const dealId   = current?.deal_id;
-    let content    = current?.content || ''; // HTML
+    const dealId   = (current?.deal_id?.value ?? current?.deal_id ?? null);
 
-    // Strip HTML tags
+    // person_id can be a number OR an object { value: 123 }
+    let personId = (current?.person_id?.value ?? current?.person_id ?? null);
+
+    let content = current?.content || ''; // HTML
     const plain = content.replace(/<[^>]*>/g, '').trim();
 
     // Only act on notes that BEGIN with "SMS:"
     const match = plain.match(/^SMS:\s*(.+)$/i);
-    if (!match) return res.send('ok');
+    if (!match) return res.send('ok'); // not an SMS note
 
     const message = match[1];
 
-    // Load the person's phone
+    // If we still don't have personId but we have a deal, fetch the deal to get person
+    if (!personId && dealId) {
+      try {
+        const { data: dealResp } = await pd.get(`/deals/${dealId}`);
+        personId = dealResp?.data?.person_id?.value ?? dealResp?.data?.person_id ?? null;
+      } catch (e) {
+        console.error('Failed to load deal for person_id', e?.response?.status, e?.response?.data);
+      }
+    }
+
+    if (!personId) {
+      console.error('No person_id on note; cannot send SMS');
+      return res.send('ok');
+    }
+
+    // Load the person's phone(s)
     const { data: personResp } = await pd.get(`/persons/${personId}`);
     const phones = personResp?.data?.phone || [];
     let to = (phones.find(p => p.primary)?.value || phones[0]?.value || '').replace(/\D/g, '');
-    if (!to) return res.send('no phone on person');
+    if (!to) {
+      console.error(`No phone numbers on person ${personId}`);
+      return res.send('ok');
+    }
 
     // Normalize to E.164
     to = to.startsWith('+')
@@ -272,13 +292,21 @@ app.post('/pipedrive-webhook', async (req, res) => {
       content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`
     });
 
-    // (Optional extra log)
+    // Extra log note (optional)
     await logNote({
       content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
-      personId, dealId
+      personId,
+      dealId: (dealId ?? undefined)
     });
 
     return res.send('ok');
+  } catch (e) {
+    console.error('PD webhook error', e?.response?.status, e?.response?.data || e);
+    // Return 200 so Pipedrive doesn't keep retrying
+    return res.status(200).send('ok');
+  }
+});
+
   } catch (e) {
     console.error(e);
     // Return 200 so Pipedrive doesn't keep retrying
