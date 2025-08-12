@@ -1,12 +1,13 @@
 // PD-SMS — Pipedrive + Twilio + Slack minimal SMS bridge
 // Endpoints:
-//   GET  /           (basic hello)
-//   GET  /health
+//   GET  /                     (hello)
+//   GET  /health               (uptime check)
 //   POST /inbound              (Twilio webhook: logs [SMS In])
 //   GET  /send-form            (Tiny form to send SMS manually)
 //   POST /send                 (Programmatic send + [SMS Out] log)
-//   POST /slack/sms            (Slack slash command /sms, instant ACK)
-//   POST /pipedrive-webhook    (Pipedrive: Note added -> if "SMS:" then send)
+//   POST /slack/sms            (Slash command /sms — instant ACK)
+//   POST /slack/events         (Reply in Slack thread -> SMS + Pipedrive log)
+//   POST /pipedrive-webhook    (Pipedrive Note "SMS:" -> SMS)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -14,8 +15,8 @@ const axios = require('axios');
 const twilioLib = require('twilio');
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false })); // Slack & Twilio post urlencoded
-app.use(bodyParser.json());                           // Pipedrive posts JSON
+app.use(bodyParser.urlencoded({ extended: false })); // Slack & Twilio (form-encoded)
+app.use(bodyParser.json());                           // Pipedrive + Slack events (JSON)
 
 // ---- Env ----
 const {
@@ -25,14 +26,21 @@ const {
   TWILIO_NUMBER, // e.g. +1480...
   TWILIO_MESSAGING_SERVICE_SID, // MG… (recommended)
   PIPEDRIVE_API_TOKEN,
-  PIPEDRIVE_BASE = 'https://primepc.pipedrive.com/api/v1',
-  SLACK_WEBHOOK_URL, // optional inbound alert
-  SLACK_ALLOWED_TEAM = 'studioprime'
+  PIPEDRIVE_BASE = 'https://primepc.pipedrive.com/api/v1', // your PD domain
+  SLACK_WEBHOOK_URL, // optional: inbound alerts to a channel
+  SLACK_ALLOWED_TEAM = 'studioprime', // your workspace guard for /sms
+  SLACK_BOT_TOKEN // required for reply-in-thread feature
 } = process.env;
 
 // ---- Clients ----
 const twilio = twilioLib(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 const pd = axios.create({ baseURL: PIPEDRIVE_BASE, params: { api_token: PIPEDRIVE_API_TOKEN } });
+const slack = SLACK_BOT_TOKEN
+  ? axios.create({
+      baseURL: 'https://slack.com/api',
+      headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` }
+    })
+  : null;
 
 // ===== Helpers =====
 function buildSendOpts(to, body) {
@@ -158,15 +166,18 @@ app.post('/send', async (req, res) => {
 
 // Slack /sms — instant ACK to avoid dispatch_failed
 app.post('/slack/sms', async (req, res) => {
-  res.status(200).send('Sending…');
+  console.log('Slash /sms hit', req.body?.team_domain, req.body?.text);
+  res.status(200).type('text/plain').send('Sending…'); // ACK fast
+
   (async () => {
     const responseUrl = req.body?.response_url;
     const postBack = async (text) => {
       if (!responseUrl) return;
       try { await axios.post(responseUrl, { text, response_type: 'ephemeral' }); } catch (_) {}
     };
+
     try {
-      if (req.body?.team_domain && req.body.team_domain !== 'studioprime') {
+      if (req.body?.team_domain && req.body.team_domain !== SLACK_ALLOWED_TEAM) {
         return postBack('Unauthorized workspace for /sms');
       }
       const text = (req.body?.text || '').trim();
@@ -191,6 +202,7 @@ app.post('/slack/sms', async (req, res) => {
         content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
         personId: person?.id, dealId: deal?.id
       });
+
       return postBack(`Sent to ${to} ✅`);
     } catch (e) {
       console.error(e);
@@ -199,13 +211,75 @@ app.post('/slack/sms', async (req, res) => {
   })();
 });
 
+// Slack Events — reply in the inbound alert thread -> send SMS + PD log
+app.post('/slack/events', async (req, res) => {
+  if (req.body?.type === 'url_verification') return res.send(req.body.challenge);
+  res.status(200).send(); // ACK immediately
+
+  if (!slack) return; // feature not enabled without bot token
+
+  const ev = req.body?.event;
+  if (!ev || ev.type !== 'message' || ev.subtype) return; // ignore edits/bots/etc.
+  if (!ev.thread_ts) return; // only handle thread replies
+
+  try {
+    // Fetch the parent message (inbound alert we posted) to extract the phone
+    const parent = await slack.get('/conversations.replies', {
+      params: { channel: ev.channel, ts: ev.thread_ts, limit: 1 }
+    });
+    const parentText = parent.data?.messages?.[0]?.text || '';
+
+    // Extract +1XXXXXXXXXX (fallback to last 10 digits)
+    let match = parentText.match(/\+1\d{10}/);
+    if (!match) {
+      const d = (parentText.match(/\d/g) || []).join('');
+      if (d.length >= 10) match = ['+1' + d.slice(-10)];
+    }
+    if (!match) {
+      await slack.post('/chat.postMessage', {
+        channel: ev.channel,
+        text: "Couldn't find a phone number in the parent message.",
+        thread_ts: ev.thread_ts
+      });
+      return;
+    }
+    const to = match[0];
+    const message = (ev.text || '').trim();
+    if (!message) return;
+
+    let person = await findPersonByPhone(to);
+    if (!person) person = await createPersonForPhone(to);
+    const deal = person ? await getPrimaryDealForPerson(person.id) : null;
+
+    await twilio.messages.create(buildSendOpts(to, message));
+    await logNote({
+      content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
+      personId: person?.id, dealId: deal?.id
+    });
+
+    await slack.post('/chat.postMessage', {
+      channel: ev.channel,
+      text: `Sent to ${to} ✅`,
+      thread_ts: ev.thread_ts
+    });
+  } catch (e) {
+    console.error('slack reply error', e?.response?.data || e);
+    try {
+      await slack.post('/chat.postMessage', {
+        channel: ev.channel,
+        text: 'Error sending SMS from this reply.',
+        thread_ts: ev.thread_ts
+      });
+    } catch (_) {}
+  }
+});
+
 // Pipedrive webhook — Note added -> if starts with "SMS:", send
 app.post('/pipedrive-webhook', async (req, res) => {
   try {
     const current = req.body?.current || {};
     const noteId  = current?.id;
     const dealId  = (current?.deal_id?.value ?? current?.deal_id ?? null);
-    // person_id may be a number OR { value: 123 }
     let personId  = (current?.person_id?.value ?? current?.person_id ?? null);
 
     let content = current?.content || ''; // HTML
@@ -215,7 +289,6 @@ app.post('/pipedrive-webhook', async (req, res) => {
     if (!match) return res.send('ok'); // Not an SMS note
     const message = match[1];
 
-    // If no personId but have a deal, fetch deal -> person
     if (!personId && dealId) {
       try {
         const { data: dealResp } = await pd.get(`/deals/${dealId}`);
@@ -229,7 +302,6 @@ app.post('/pipedrive-webhook', async (req, res) => {
       return res.send('ok');
     }
 
-    // Load person phones
     const { data: personResp } = await pd.get(`/persons/${personId}`);
     const phones = personResp?.data?.phone || [];
     let to = (phones.find(p => p.primary)?.value || phones[0]?.value || '').replace(/\D/g, '');
@@ -237,22 +309,17 @@ app.post('/pipedrive-webhook', async (req, res) => {
       console.error(`No phone numbers on person ${personId}`);
       return res.send('ok');
     }
-
-    // Normalize to E.164
     to = to.startsWith('+')
       ? to
       : (to.length === 11 && to.startsWith('1')) ? ('+' + to)
       : ('+1' + to.slice(-10));
 
-    // Send and log
     await twilio.messages.create(buildSendOpts(to, message));
 
-    // Rewrite original note to a clean log
     await pd.put(`/notes/${noteId}`, {
       content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`
     });
 
-    // Optional extra log
     await logNote({
       content: `[SMS Out] ${new Date().toLocaleString()} – "${message}"`,
       personId, dealId: (dealId ?? undefined)
