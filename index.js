@@ -5,8 +5,8 @@
 //   POST /inbound              (Twilio webhook: logs [SMS In])
 //   GET  /send-form            (Tiny form to send SMS manually)
 //   POST /send                 (Programmatic send + [SMS Out] log)
-//   POST /slack/sms            (Slash command /sms — instant ACK)
-//   POST /slack/events         (Reply in Slack thread -> SMS + Pipedrive log; idempotent)
+//   POST /slack/sms            (Slash command /sms — public confirmation)
+//   POST /slack/events         (Reply in Slack thread -> SMS + PD log; idempotent)
 //   POST /pipedrive-webhook    (Pipedrive Note "SMS:" -> SMS)
 
 const express = require('express');
@@ -172,16 +172,16 @@ app.post('/send', async (req, res) => {
   }
 });
 
-// Slack /sms — instant ACK to avoid dispatch_failed
+// Slack /sms — public confirmation (in_channel) & no "Sending..." bubble
 app.post('/slack/sms', async (req, res) => {
   console.log('Slash /sms hit', req.body?.team_domain, req.body?.text);
-  res.status(200).type('text/plain').send('Sending…'); // ACK fast
+  res.status(200).send(); // empty ACK so Slack shows nothing immediately
 
   (async () => {
     const responseUrl = req.body?.response_url;
     const postBack = async (text) => {
       if (!responseUrl) return;
-      try { await axios.post(responseUrl, { text, response_type: 'ephemeral' }); } catch (_) {}
+      try { await axios.post(responseUrl, { text, response_type: 'in_channel' }); } catch (_) {}
     };
 
     try {
@@ -211,7 +211,7 @@ app.post('/slack/sms', async (req, res) => {
         personId: person?.id, dealId: deal?.id
       });
 
-      return postBack(`Sent to ${to} ✅`);
+      return postBack(`Sent to ${to}: "${message}" ✅`);
     } catch (e) {
       console.error(e);
       return postBack('Something went wrong sending your SMS.');
@@ -221,16 +221,13 @@ app.post('/slack/sms', async (req, res) => {
 
 // Slack Events — reply in inbound alert thread -> SMS + PD log (idempotent)
 app.post('/slack/events', async (req, res) => {
-  // URL verification handshake
   if (req.body?.type === 'url_verification') return res.send(req.body.challenge);
 
-  // Tell Slack not to retry and ACK immediately
   if (req.headers['x-slack-retry-num']) res.set('X-Slack-No-Retry', '1');
   res.status(200).send();
 
   if (!slack) return; // feature not enabled without bot token
 
-  // De-dup by event_id
   const eventId = req.body?.event_id;
   if (eventId) {
     if (processedEvents.has(eventId)) return;
@@ -239,20 +236,16 @@ app.post('/slack/events', async (req, res) => {
 
   const ev = req.body?.event;
   if (!ev) return;
-
-  // Ignore anything that isn't a user message in a thread
   if (ev.type !== 'message') return;
   if (ev.subtype || ev.bot_id || !ev.user) return; // skip bot/system/edited etc.
   if (!ev.thread_ts) return; // only act on thread replies
 
   try {
-    // Fetch the parent message (inbound alert we posted) to extract the phone
     const parent = await slack.get('/conversations.replies', {
       params: { channel: ev.channel, ts: ev.thread_ts, limit: 1 }
     });
     const parentText = parent.data?.messages?.[0]?.text || '';
 
-    // Extract +1XXXXXXXXXX (fallback to last 10 digits)
     let match = parentText.match(/\+1\d{10}/);
     if (!match) {
       const d = (parentText.match(/\d/g) || []).join('');
@@ -270,7 +263,6 @@ app.post('/slack/events', async (req, res) => {
     const message = (ev.text || '').trim();
     if (!message) return;
 
-    // Send + log
     let person = await findPersonByPhone(to);
     if (!person) person = await createPersonForPhone(to);
     const deal = person ? await getPrimaryDealForPerson(person.id) : null;
@@ -283,7 +275,7 @@ app.post('/slack/events', async (req, res) => {
 
     await slack.post('/chat.postMessage', {
       channel: ev.channel,
-      text: `Sent to ${to} ✅`,
+      text: `Sent to ${to}: "${message}" ✅`,
       thread_ts: ev.thread_ts
     });
   } catch (e) {
